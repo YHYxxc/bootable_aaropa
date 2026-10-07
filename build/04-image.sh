@@ -30,6 +30,10 @@ aaropa_prepare_build_context() {
     fi
     aaropa_log "pkglist grub theme: $want_grub"
   fi
+  # bass-repair (overlay/rootfs/usr/bin) uses dialog; it falls back to whiptail/plain text.
+  if [[ -f "$pkglist" ]] && ! grep -qx 'dialog' "$pkglist"; then
+    printf '\n%s\n' dialog >>"$pkglist"
+  fi
   AAROPA_BUILD_CTX="$ctx"
 }
 

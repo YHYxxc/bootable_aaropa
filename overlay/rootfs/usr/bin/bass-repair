@@ -1,0 +1,856 @@
+#!/bin/bash
+# bass-repair: fix the boot files of an installed Bass OS from the live USB.
+#
+# Started from the USB GRUB entry "Repair an existing installation > Open the repair
+# tool" (BASS_REPAIR=1), or from the live desktop menu.
+#
+# What it may write, always after a copy to <install>/boot/grub/repair-<time>/:
+#   <install>/boot/grub/android.cfg and grub.cfg       (default, config only)
+#   \EFI\<id>\ on the install's ESP, one NVRAM entry     (only "Reinstall Bass GRUB")
+#   \EFI\Boot\bootx64.efi                                (only when absent or ours,
+#                                                         or after explicit consent)
+#   the MBR of the install's disk                        (BIOS, only after consent)
+# It never writes data/, data.img, other operating systems' partitions or EFI
+# directories, and it never formats anything.
+#
+# Tests source this file with BASS_REPAIR_LIB=1 to get the functions without the UI.
+
+BR_TIME="$(date +%Y%m%d-%H%M%S)"
+BR_MNT="${BR_MNT:-/tmp/bass-repair}"
+BR_LOG="${BR_LOG:-/tmp/bass-repair.log}"
+BR_CDROM="${BR_CDROM:-/cdrom}"
+BR_ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+BR_BIOS_GRUB_GUID="21686148-6449-6e6f-744e-656564454649"
+BR_FORBIDDEN="'\"\`\$\\"
+
+br_log() {
+	echo "$(date +%T) $*" >>"$BR_LOG"
+}
+
+# ---------------------------------------------------------------- android.cfg
+
+# Same rules as bass_init.sh (Android side): one SLOT=_a/_b, one quoted CMDLINE without
+# quotes or shell characters, no stray quotes elsewhere, MODE (if any) normal|recovery.
+br_cfg_valid() {
+	local f="$1"
+	[ -s "$f" ] || return 1
+	[ "$(grep -c '^[[:space:]]*SLOT=' "$f")" -eq 1 ] || return 1
+	grep -qE '^[[:space:]]*SLOT=_?[abAB][[:space:]]*$' "$f" || return 1
+	[ "$(grep -c '^[[:space:]]*CMDLINE=' "$f")" -eq 1 ] || return 1
+	grep -qE "^[[:space:]]*CMDLINE=('[^'\"\`\$\\\\]*'|\"[^'\"\`\$\\\\]*\")[[:space:]]*\$" "$f" || return 1
+	! grep -vE '^[[:space:]]*(#|CMDLINE=)' "$f" | grep -q "['\"]" || return 1
+	if grep -q '^[[:space:]]*MODE=' "$f"; then
+		grep -qE '^[[:space:]]*MODE=(normal|recovery)[[:space:]]*$' "$f" || return 1
+	fi
+	if command -v grub-script-check >/dev/null 2>&1; then
+		grub-script-check "$f" >/dev/null 2>&1 || return 1
+	fi
+	return 0
+}
+
+# SLOT of a valid android.cfg, as _a or _b.
+br_cfg_slot() {
+	sed -nE 's/^[[:space:]]*SLOT=_?([abAB])[[:space:]]*$/_\1/p' "$1" | head -n1 | tr 'AB' 'ab'
+}
+
+# CMDLINE value of a valid android.cfg, without the quotes.
+br_cfg_cmdline() {
+	sed -nE "s/^[[:space:]]*CMDLINE=['\"](.*)['\"][[:space:]]*\$/\1/p" "$1" | head -n1
+}
+
+# Tokens of a command line that are safe inside CMDLINE='...', space separated.
+br_clean_cmdline() {
+	local tok out=""
+	for tok in $1; do
+		case "$tok" in
+		*[\'\"\`\$\\]*) br_log "dropped unsafe option: $tok" ;;
+		*) out="${out:+$out }$tok" ;;
+		esac
+	done
+	printf '%s\n' "$out"
+}
+
+br_render_cfg() {
+	printf "SLOT=%s\nCMDLINE='%s'\nMODE=normal\n" "$1" "$(br_clean_cmdline "$2")"
+}
+
+# Complete slots of an install root: kernel, initrd and system image present.
+br_root_slots() {
+	local root="$1" s out=""
+	for s in _a _b; do
+		if [ -f "$root/kernel$s" ] && [ -f "$root/initrd$s.img" ] &&
+			{ [ -f "$root/system$s.img" ] || [ -f "$root/system$s.sfs" ] || [ -f "$root/system$s.efs" ]; }; then
+			out="${out:+$out }$s"
+		fi
+	done
+	printf '%s\n' "$out"
+}
+
+br_is_bass_root() {
+	[ -f "$1/boot/grub/android.cfg" ] && [ -n "$(br_root_slots "$1")" ]
+}
+
+# Slot to write: the current one if it is valid and complete, else the first complete one.
+br_pick_slot() {
+	local root="$1" slots cur
+	slots="$(br_root_slots "$root")"
+	if br_cfg_valid "$root/boot/grub/android.cfg"; then
+		cur="$(br_cfg_slot "$root/boot/grub/android.cfg")"
+		case " $slots " in *" $cur "*)
+			echo "$cur"
+			return
+			;;
+		esac
+	fi
+	echo "${slots%% *}"
+}
+
+# ------------------------------------------------------------------ file writes
+
+# Refuse any path under data/ or data.img of an install.
+br_safe_target() {
+	case "$1" in
+	*/data | */data/* | */data.img) return 1 ;;
+	esac
+	return 0
+}
+
+# br_backup ROOT FILE... -> copies existing FILEs into ROOT/boot/grub/repair-<time>/.
+br_backup() {
+	local root="$1" dir f
+	shift
+	dir="$root/boot/grub/repair-$BR_TIME"
+	mkdir -p "$dir" || return 1
+	for f in "$@"; do
+		[ -e "$f" ] && cp -a "$f" "$dir/" 2>/dev/null
+	done
+	cp -f "$BR_LOG" "$dir/bass-repair.log" 2>/dev/null
+	return 0
+}
+
+# br_replace_file FILE CONTENT -> temp file + sync + rename in the same directory.
+br_replace_file() {
+	local f="$1" tmp
+	br_safe_target "$f" || return 1
+	tmp="$f.tmp.$$"
+	printf '%s' "$2" >"$tmp" || {
+		rm -f "$tmp"
+		return 1
+	}
+	chmod 644 "$tmp"
+	sync
+	mv -f "$tmp" "$f" || {
+		rm -f "$tmp"
+		return 1
+	}
+	sync
+}
+
+# br_write_android_cfg ROOT CONTENT -> backup, write, verify.
+br_write_android_cfg() {
+	local root="$1" content="$2" cfg tmpcheck
+	cfg="$root/boot/grub/android.cfg"
+	tmpcheck="$(mktemp)"
+	printf '%s' "$content" >"$tmpcheck"
+	if ! br_cfg_valid "$tmpcheck"; then
+		rm -f "$tmpcheck"
+		br_log "refusing to write invalid android.cfg"
+		return 1
+	fi
+	rm -f "$tmpcheck"
+	br_backup "$root" "$cfg" "$cfg.good" "$cfg.bak" || return 1
+	br_replace_file "$cfg" "$content" || return 1
+	br_cfg_valid "$cfg" || return 1
+	br_log "wrote $cfg"
+}
+
+# ------------------------------------------------------------- ESP / UEFI rules
+
+# ESP UUID recorded by the installer in <root>/fstab.android (genfstab -U).
+br_fstab_esp_uuid() {
+	[ -f "$1/fstab.android" ] || return 0
+	awk '$2 == "/boot/efi" && $1 ~ /^UUID=/ { sub(/^UUID=/, "", $1); print $1; exit }' "$1/fstab.android"
+}
+
+# EFI directories on a mounted ESP whose GRUB image embeds UUID (GRUB embeds the
+# install's filesystem UUID in its search command).
+br_esp_dirs_for_uuid() {
+	local esp="$1" uuid="$2" f d
+	[ -n "$uuid" ] || return 0
+	for f in "$esp"/[Ee][Ff][Ii]/*/grub*.efi; do
+		[ -f "$f" ] || continue
+		case "$f" in */[Ee][Ff][Ii]/[Bb][Oo][Oo][Tt]/*) continue ;; esac
+		if grep -aqi "$uuid" "$f"; then
+			d="${f%/*}"
+			echo "${d##*/}"
+		fi
+	done | sort -u
+}
+
+# Short listing of an ESP's EFI directories, e.g. "Boot Microsoft ubuntu".
+br_esp_contents() {
+	local d out=""
+	for d in "$1"/[Ee][Ff][Ii]/*/; do
+		[ -d "$d" ] || continue
+		d="${d%/}"
+		out="${out:+$out }${d##*/}"
+	done
+	echo "${out:-empty}"
+}
+
+# br_choose_esp FSTAB_UUID INSTALL_UUID INSTALL_DISK < "dev uuid disk mountpoint" lines
+# Prints the chosen ESP device, or ASK when the user has to pick.
+#   1. ESP whose UUID is in fstab.android
+#   2. ESP with an EFI directory that embeds the install UUID
+#   3. the only ESP on the install's disk
+br_choose_esp() {
+	local want="$1" uuid="$2" disk="$3" dev euuid edisk emp same_disk=() n=0
+	local -a devs=() uuids=() disks=() mps=()
+	while read -r dev euuid edisk emp; do
+		[ -n "$dev" ] || continue
+		devs+=("$dev")
+		uuids+=("$euuid")
+		disks+=("$edisk")
+		mps+=("$emp")
+	done
+	if [ -n "$want" ]; then
+		for n in "${!devs[@]}"; do
+			if [ "${uuids[$n],,}" = "${want,,}" ]; then
+				echo "${devs[$n]}"
+				return
+			fi
+		done
+	fi
+	for n in "${!devs[@]}"; do
+		if [ -n "${mps[$n]}" ] && [ -n "$(br_esp_dirs_for_uuid "${mps[$n]}" "$uuid")" ]; then
+			echo "${devs[$n]}"
+			return
+		fi
+	done
+	for n in "${!devs[@]}"; do
+		[ "${disks[$n]}" = "$disk" ] && same_disk+=("${devs[$n]}")
+	done
+	if [ "${#same_disk[@]}" -eq 1 ]; then
+		echo "${same_disk[0]}"
+		return
+	fi
+	echo ASK
+}
+
+# EFI directory id to use: the one that already boots this install, else BassOS-<uuid8>.
+br_efi_id() {
+	local esp="$1" uuid="$2" id
+	id="$(br_esp_dirs_for_uuid "$esp" "$uuid" | head -n1)"
+	if [ -z "$id" ]; then
+		id="BassOS-$(printf '%s' "$uuid" | tr -d '-' | cut -c1-8)"
+	fi
+	echo "$id"
+}
+
+# State of \EFI\Boot\bootx64.efi relative to this install:
+#   absent | ours | foreign-microsoft | foreign-shim | foreign-grub | foreign
+br_fallback_state() {
+	local esp="$1" id="$2" uuid="$3" fb ours
+	fb="$(br_fallback_path "$esp")"
+	[ -n "$fb" ] || {
+		echo absent
+		return
+	}
+	ours="$esp/EFI/$id/grubx64.efi"
+	if [ -f "$ours" ] && cmp -s "$fb" "$ours"; then
+		echo ours
+	elif [ -n "$uuid" ] && grep -aqi "$uuid" "$fb"; then
+		echo ours
+	elif grep -aq "Microsoft" "$fb" && grep -aq -i "bootmgr" "$fb"; then
+		echo foreign-microsoft
+	elif grep -aq -i "shim" "$fb"; then
+		echo foreign-shim
+	elif grep -aq "GRUB" "$fb"; then
+		echo foreign-grub
+	else
+		echo foreign
+	fi
+}
+
+br_fallback_path() {
+	local f
+	for f in "$1"/[Ee][Ff][Ii]/[Bb][Oo][Oo][Tt]/[Bb][Oo][Oo][Tt][Xx]64.[Ee][Ff][Ii]; do
+		[ -f "$f" ] && {
+			echo "$f"
+			return
+		}
+	done
+}
+
+# Copy our GRUB to the fallback path. Callers decide consent; this only refuses when
+# the source is missing and keeps a timestamped copy of whatever was there.
+br_install_fallback() {
+	local esp="$1" id="$2" src fb
+	src="$esp/EFI/$id/grubx64.efi"
+	[ -f "$src" ] || return 1
+	fb="$(br_fallback_path "$esp")"
+	if [ -n "$fb" ]; then
+		cp -a "$fb" "$fb.bak-$BR_TIME" || return 1
+	else
+		mkdir -p "$esp/EFI/Boot" || return 1
+		fb="$esp/EFI/Boot/bootx64.efi"
+	fi
+	cp -f "$src" "$fb" && sync
+}
+
+# ------------------------------------------------------------- MBR / BIOS rules
+
+# Owner of the boot code in the first 440 bytes of DISK (device or image file):
+#   empty | grub | windows | syslinux | other
+br_mbr_owner() {
+	local code
+	code="$(head -c 440 "$1" 2>/dev/null | LC_ALL=C tr -c '[:print:]' '.')"
+	if [ -z "$(head -c 440 "$1" 2>/dev/null | LC_ALL=C tr -d '\000')" ]; then
+		echo empty
+	elif [[ "$code" == *GRUB* ]]; then
+		echo grub
+	elif [[ "$code" == *"Invalid partition table"* || "$code" == *"Error loading operating system"* || "$code" == *"Missing operating system"* ]]; then
+		echo windows
+	elif [[ "$code" == *SYSLINUX* || "$code" == *"Missing OS"* ]]; then
+		echo syslinux
+	else
+		echo other
+	fi
+}
+
+br_disk_label() {
+	sfdisk --json "$1" 2>/dev/null | sed -nE 's/.*"label": *"([a-z]+)".*/\1/p' | head -n1
+}
+
+br_has_bios_grub() {
+	sfdisk --json "$1" 2>/dev/null | grep -qi "\"type\": *\"$BR_BIOS_GRUB_GUID\""
+}
+
+# Entry for another GRUB that should keep owning the MBR.
+br_chain_snippet() {
+	cat <<EOF
+menuentry "Bass OS" {
+	insmod part_gpt
+	insmod part_msdos
+	insmod ext2
+	insmod ntfs
+	search --no-floppy --fs-uuid --set=root $1
+	configfile /boot/grub/grub.cfg
+}
+EOF
+}
+
+# ------------------------------------------------------------- devices (live)
+
+# Disks to leave alone: the one $BR_CDROM (the live USB) is mounted from, and any disk
+# carrying an iso9660 filesystem (this USB, or another installer stick, incl. its EFI
+# partition).
+br_live_disk() {
+	local src name fs
+	src="$(findmnt -no SOURCE "$BR_CDROM" 2>/dev/null | head -n1)"
+	[ -b "$src" ] && br_disk_of "$src"
+	while read -r name fs; do
+		[ "$fs" = iso9660 ] && br_disk_of "$name"
+	done < <(lsblk -rpno NAME,FSTYPE 2>/dev/null)
+}
+
+br_disk_of() {
+	local pk
+	pk="$(lsblk -no PKNAME "$1" 2>/dev/null | head -n1)"
+	if [ -n "$pk" ]; then echo "/dev/$pk"; else echo "$1"; fi
+}
+
+br_mount() {
+	local dev="$1" mp="$2" mode="$3" fs
+	fs="$(blkid -o value -s TYPE "$dev" 2>/dev/null)"
+	mkdir -p "$mp"
+	if [ "$fs" = ntfs ]; then
+		mount -t ntfs-3g -o "$mode" "$dev" "$mp" 2>>"$BR_LOG"
+	else
+		mount -o "$mode" "$dev" "$mp" 2>>"$BR_LOG"
+	fi
+}
+
+# Remount read-write. NTFS refuses when Windows is hibernated (Fast Startup).
+br_rw() {
+	local i="$1"
+	umount "${BR_MP[$i]}" 2>>"$BR_LOG"
+	if br_mount "${BR_DEV[$i]}" "${BR_MP[$i]}" rw; then
+		return 0
+	fi
+	br_mount "${BR_DEV[$i]}" "${BR_MP[$i]}" ro
+	if [ "${BR_FS[$i]}" = ntfs ]; then
+		ui_msg "The partition ${BR_DEV[$i]} is locked by Windows (hibernation or Fast Startup).\n\nStart Windows, choose Shut down while holding Shift (or turn off Fast Startup), then try again. Nothing was changed."
+	else
+		ui_msg "Could not open ${BR_DEV[$i]} for writing. Nothing was changed.\n\nDetails are in $BR_LOG."
+	fi
+	return 1
+}
+
+br_ro() {
+	local i="$1"
+	sync
+	umount "${BR_MP[$i]}" 2>>"$BR_LOG"
+	br_mount "${BR_DEV[$i]}" "${BR_MP[$i]}" ro
+}
+
+# Fill BR_DEV / BR_MP / BR_FS / BR_UUID / BR_LABEL with Bass installs (mounted read-only).
+br_scan() {
+	local live name type fs mp
+	BR_DEV=()
+	BR_MP=()
+	BR_FS=()
+	BR_UUID=()
+	BR_LABEL=()
+	live=" $(br_live_disk | tr '\n' ' ') "
+	while read -r name type fs; do
+		case "$type" in part | disk | lvm | raid*) ;; *) continue ;; esac
+		case "$fs" in ext2 | ext3 | ext4 | ntfs | vfat | exfat | btrfs | f2fs | xfs) ;; *) continue ;; esac
+		case "$live" in *" $(br_disk_of "$name") "* | *" $name "*) continue ;; esac
+		findmnt -rno TARGET "$name" >/dev/null 2>&1 && continue
+		mp="$BR_MNT/${name##*/}"
+		br_mount "$name" "$mp" ro || continue
+		if br_is_bass_root "$mp"; then
+			BR_DEV+=("$name")
+			BR_MP+=("$mp")
+			BR_FS+=("$fs")
+			BR_UUID+=("$(blkid -o value -s UUID "$name" 2>/dev/null)")
+			BR_LABEL+=("$(blkid -o value -s LABEL "$name" 2>/dev/null)")
+			br_log "found Bass install on $name ($fs)"
+		else
+			umount "$mp" 2>/dev/null
+			rmdir "$mp" 2>/dev/null
+		fi
+	done < <(lsblk -rpno NAME,TYPE,FSTYPE 2>/dev/null)
+}
+
+br_cleanup() {
+	local mp
+	sync
+	for mp in "$BR_MNT"/*; do
+		[ -d "$mp" ] || continue
+		umount "$mp" 2>/dev/null
+		rmdir "$mp" 2>/dev/null
+	done
+}
+
+# ESPs on all non-live disks as "dev uuid disk mountpoint" (mounted read-only).
+br_esps() {
+	local live name ptype fs mp
+	live=" $(br_live_disk | tr '\n' ' ') "
+	while read -r name ptype fs; do
+		case "${ptype,,}" in "$BR_ESP_GUID" | 0xef) ;; *) continue ;; esac
+		[ "$fs" = vfat ] || continue
+		case "$live" in *" $(br_disk_of "$name") "*) continue ;; esac
+		mp="$BR_MNT/esp-${name##*/}"
+		if ! findmnt -rn "$mp" >/dev/null 2>&1; then
+			br_mount "$name" "$mp" ro || continue
+		fi
+		echo "$name $(blkid -o value -s UUID "$name" 2>/dev/null) $(br_disk_of "$name") $mp"
+	done < <(lsblk -rpno NAME,PARTTYPE,FSTYPE 2>/dev/null)
+}
+
+br_bitlocker_on_disk() {
+	lsblk -rpno FSTYPE "$1" 2>/dev/null | grep -qi '^BitLocker$'
+}
+
+# -------------------------------------------------------------------------- UI
+
+br_ui_init() {
+	if command -v dialog >/dev/null 2>&1; then
+		BR_UI=dialog
+	elif command -v whiptail >/dev/null 2>&1; then
+		BR_UI=whiptail
+	else
+		BR_UI=plain
+	fi
+}
+
+ui_msg() {
+	case "$BR_UI" in
+	plain)
+		printf '\n%b\n\nPress Enter to continue.' "$1"
+		read -r _
+		;;
+	*) "$BR_UI" --title "Bass OS repair" --msgbox "$(printf '%b' "$1")" 20 76 ;;
+	esac
+}
+
+# ui_yesno TEXT [no] -> 0 for yes. Second argument makes No the default.
+ui_yesno() {
+	local def=()
+	[ "${2:-}" = no ] && def=(--defaultno)
+	case "$BR_UI" in
+	plain)
+		printf '\n%b\n[y/N] ' "$1"
+		read -r _a
+		[ "$_a" = y ] || [ "$_a" = Y ]
+		;;
+	*) "$BR_UI" --title "Bass OS repair" "${def[@]}" --yesno "$(printf '%b' "$1")" 22 76 ;;
+	esac
+}
+
+# ui_menu TEXT TAG ITEM [TAG ITEM...] -> prints chosen TAG.
+ui_menu() {
+	local text="$1" n i
+	shift
+	case "$BR_UI" in
+	plain)
+		printf '\n%b\n' "$text" >&2
+		n=0
+		while [ $# -gt 0 ]; do
+			n=$((n + 1))
+			printf '  %s) %s\n' "$1" "$2" >&2
+			shift 2
+		done
+		printf 'Choice: ' >&2
+		read -r i
+		echo "$i"
+		;;
+	*)
+		"$BR_UI" --title "Bass OS repair" --menu "$(printf '%b' "$text")" 22 76 12 "$@" 3>&1 1>&2 2>&3
+		;;
+	esac
+}
+
+# ------------------------------------------------------------------- actions
+
+br_status() {
+	local root="$1" cfg f out
+	cfg="$root/boot/grub/android.cfg"
+	out="Slots: $(br_root_slots "$root")\n\n"
+	for f in "$cfg" "$cfg.good" "$cfg.bak"; do
+		if [ ! -e "$f" ]; then
+			out+="${f##*/}: missing\n"
+		elif br_cfg_valid "$f"; then
+			out+="${f##*/}: OK (slot $(br_cfg_slot "$f"))\n"
+		else
+			out+="${f##*/}: DAMAGED\n"
+		fi
+	done
+	if [ -s "$root/cmdline.txt" ]; then out+="cmdline.txt: present\n"; else out+="cmdline.txt: missing\n"; fi
+	if [ -f "$root/boot/grub/grub.cfg" ]; then
+		if grub-script-check "$root/boot/grub/grub.cfg" >/dev/null 2>&1; then
+			out+="grub.cfg: OK\n"
+		else
+			out+="grub.cfg: DAMAGED\n"
+		fi
+	else
+		out+="grub.cfg: missing\n"
+	fi
+	echo "$out"
+}
+
+# br_restore I SOURCE (good|bak|cmdline|defaults)
+br_restore() {
+	local i="$1" what="$2" root cfg content slot
+	root="${BR_MP[$i]}"
+	cfg="$root/boot/grub/android.cfg"
+	slot="$(br_pick_slot "$root")"
+	case "$what" in
+	good | bak)
+		br_cfg_valid "$cfg.$what" || {
+			ui_msg "android.cfg.$what is missing or damaged."
+			return 1
+		}
+		content="$(cat "$cfg.$what")"$'\n'
+		;;
+	cmdline)
+		[ -s "$root/cmdline.txt" ] || {
+			ui_msg "cmdline.txt is missing."
+			return 1
+		}
+		content="$(br_render_cfg "$slot" "$(head -n1 "$root/cmdline.txt")")"$'\n'
+		;;
+	defaults)
+		[ -s "$BR_CDROM/cmdline.txt" ] || {
+			ui_msg "This USB has no default command line ($BR_CDROM/cmdline.txt)."
+			return 1
+		}
+		content="$(br_render_cfg "$slot" "$(head -n1 "$BR_CDROM/cmdline.txt")")"$'\n'
+		;;
+	esac
+	ui_yesno "Write this to ${BR_DEV[$i]} /boot/grub/android.cfg?\n\n$content\nThe current file is copied to boot/grub/repair-$BR_TIME/ first." || return 1
+	br_rw "$i" || return 1
+	if br_write_android_cfg "$root" "$content"; then
+		br_ro "$i"
+		ui_msg "Boot configuration restored. You can reboot now."
+	else
+		br_ro "$i"
+		ui_msg "Writing android.cfg failed. Nothing usable was changed.\n\nDetails are in $BR_LOG."
+		return 1
+	fi
+}
+
+# Regenerate <install>/boot/grub/grub.cfg the way the installer does (10_blissos as
+# 10_linux, os-prober on, GRUB_DEFAULT=saved). custom.cfg is left as is.
+br_regen_grubcfg() {
+	local i="$1" root dev tmpl rc=0
+	root="${BR_MP[$i]}"
+	dev="${BR_DEV[$i]}"
+	tmpl=/etc/calamares/scripts/10_blissos
+	[ -f "$tmpl" ] || tmpl=/usr/share/calamares/scripts/10_blissos
+	if [ ! -f "$tmpl" ] || ! command -v grub-mkconfig >/dev/null 2>&1; then
+		ui_msg "This USB cannot rebuild the GRUB menu (grub-mkconfig or 10_blissos missing)."
+		return 1
+	fi
+	ui_yesno "Rebuild the GRUB menu of ${BR_DEV[$i]}?\n\nOther systems found by os-prober (Windows, Linux) stay in the menu. The current grub.cfg is copied to boot/grub/repair-$BR_TIME/ first." || return 1
+	br_rw "$i" || return 1
+
+	[ -f /etc/grub.d/10_linux.bass-repair ] || cp -a /etc/grub.d/10_linux /etc/grub.d/10_linux.bass-repair 2>/dev/null
+	cp -f "$tmpl" /etc/grub.d/10_linux && chmod 755 /etc/grub.d/10_linux
+	sed -i -r 's/(GRUB_DEVICE(_BOOT)?)=.*$/\1=\$\1/g' "$(command -v grub-mkconfig)"
+	cp -a /etc/default/grub /etc/default/grub.bass-repair
+	{
+		echo "GRUB_TIMEOUT=10"
+		echo "GRUB_TIMEOUT_STYLE=menu"
+		echo "GRUB_DISTRIBUTOR=BlissLabs"
+		echo "GRUB_GFXPAYLOAD_LINUX=keep"
+		echo "GRUB_DISABLE_OS_PROBER=false"
+		echo "GRUB_DEFAULT=saved"
+		echo "GRUB_SAVEDEFAULT=true"
+		echo "GRUB_DEVICE='$dev'"
+		echo "GRUB_DEVICE_BOOT='$dev'"
+		echo "SRC="
+		local theme
+		theme="$(find "$root/boot/grub/themes" -mindepth 1 -maxdepth 2 -name theme.txt -print -quit 2>/dev/null)"
+		[ -n "$theme" ] && echo "GRUB_THEME='$theme'"
+	} >>/etc/default/grub
+
+	if GRUB_DEVICE="$dev" GRUB_DEVICE_BOOT="$dev" grub-mkconfig -o "$root/boot/grub/grub.cfg.new" >>"$BR_LOG" 2>&1 &&
+		grub-script-check "$root/boot/grub/grub.cfg.new" >>"$BR_LOG" 2>&1 &&
+		grep -q 'android.cfg' "$root/boot/grub/grub.cfg.new"; then
+		br_backup "$root" "$root/boot/grub/grub.cfg"
+		mv -f "$root/boot/grub/grub.cfg.new" "$root/boot/grub/grub.cfg"
+		sync
+	else
+		rm -f "$root/boot/grub/grub.cfg.new"
+		rc=1
+	fi
+	mv -f /etc/default/grub.bass-repair /etc/default/grub
+	[ -f /etc/grub.d/10_linux.bass-repair ] && cp -a /etc/grub.d/10_linux.bass-repair /etc/grub.d/10_linux
+	br_ro "$i"
+	if [ "$rc" -eq 0 ]; then
+		ui_msg "GRUB menu rebuilt."
+	else
+		ui_msg "Rebuilding the GRUB menu failed; the old grub.cfg was kept.\n\nDetails are in $BR_LOG."
+	fi
+	return "$rc"
+}
+
+br_reinstall_uefi() {
+	local i="$1" root uuid disk want esp espdev esps line id state nv fb_action make_default=no part_num summary
+	root="${BR_MP[$i]}"
+	uuid="${BR_UUID[$i]}"
+	disk="$(br_disk_of "${BR_DEV[$i]}")"
+	want="$(br_fstab_esp_uuid "$root")"
+	esps="$(br_esps)"
+	[ -n "$esps" ] || {
+		ui_msg "No EFI system partition found. Nothing was changed."
+		return 1
+	}
+	espdev="$(br_choose_esp "$want" "$uuid" "$disk" <<<"$esps")"
+	if [ "$espdev" = ASK ]; then
+		local args=()
+		while read -r line; do
+			set -- $line
+			args+=("$1" "$(lsblk -no SIZE "$1" | head -n1) on $3: $(br_esp_contents "$4")")
+		done <<<"$esps"
+		espdev="$(ui_menu "Which EFI system partition boots this Bass OS?" "${args[@]}")" || return 1
+	fi
+	esp="$(awk -v d="$espdev" '$1 == d { print $4 }' <<<"$esps")"
+	[ -n "$esp" ] || return 1
+
+	id="$(br_efi_id "$esp" "$uuid")"
+	state="$(br_fallback_state "$esp" "$id" "$uuid")"
+	# UI text goes through printf %b, so ESP paths are shown with / (a \b would be a backspace).
+	case "$state" in
+	absent | ours) fb_action="write EFI/Boot/bootx64.efi (currently $state)" ;;
+	*) fb_action="leave EFI/Boot/bootx64.efi alone ($state)" ;;
+	esac
+	if efibootmgr -v 2>/dev/null | grep -qi "\\\\EFI\\\\$id\\\\grubx64.efi"; then
+		nv="keep the existing boot entry for EFI/$id"
+	else
+		nv="add one boot entry \"Bass OS\" for EFI/$id"
+	fi
+	ui_yesno "Make Bass OS the first boot entry?\n\nChoose No to keep the current boot order (Windows or another system stays the default)." no && make_default=yes
+
+	summary="Install: ${BR_DEV[$i]} (UUID $uuid)\nESP: $espdev, contains: $(br_esp_contents "$esp")\nGRUB goes to: EFI/$id/\nNVRAM: $nv\nBoot order: $([ "$make_default" = yes ] && echo "Bass OS first" || echo unchanged)\nFallback: $fb_action\n\nNo other EFI directory is changed."
+	if br_bitlocker_on_disk "$disk"; then
+		summary+="\n\nWARNING: this disk has a BitLocker volume. Changing boot entries can make Windows ask for the BitLocker recovery key. Have it ready."
+	fi
+	ui_yesno "Reinstall Bass GRUB?\n\n$summary" no || return 1
+
+	br_rw "$i" || return 1
+	umount "$esp" 2>>"$BR_LOG"
+	br_mount "$espdev" "$esp" rw || {
+		br_ro "$i"
+		ui_msg "Could not open the ESP for writing. Nothing was changed."
+		return 1
+	}
+	br_backup "$root" "$esp/EFI/$id/grubx64.efi" "$(br_fallback_path "$esp")"
+	efibootmgr >"$root/boot/grub/repair-$BR_TIME/efibootmgr-before.txt" 2>&1
+
+	if ! grub-install --target=x86_64-efi --efi-directory="$esp" --bootloader-id="$id" \
+		--boot-directory="$root/boot" --no-nvram >>"$BR_LOG" 2>&1; then
+		umount "$esp"
+		br_mount "$espdev" "$esp" ro
+		br_ro "$i"
+		ui_msg "grub-install failed; see $BR_LOG."
+		return 1
+	fi
+
+	case "$state" in
+	absent | ours) br_install_fallback "$esp" "$id" ;;
+	*)
+		if ui_yesno "EFI/Boot/bootx64.efi belongs to another system ($state).\n\nReplace it with Bass GRUB anyway? A copy is kept as bootx64.efi.bak-$BR_TIME. Only needed if this PC ignores boot entries." no; then
+			br_install_fallback "$esp" "$id"
+		fi
+		;;
+	esac
+
+	if ! efibootmgr -v 2>/dev/null | grep -qi "\\\\EFI\\\\$id\\\\grubx64.efi"; then
+		part_num="$(lsblk -no PARTN "$espdev" 2>/dev/null | head -n1)"
+		local before new
+		before="$(efibootmgr | sed -n 's/^BootOrder: //p')"
+		efibootmgr -C -d "$(br_disk_of "$espdev")" -p "$part_num" -L "Bass OS" -l "\\EFI\\$id\\grubx64.efi" >>"$BR_LOG" 2>&1
+		new="$(efibootmgr -v | grep -i "\\\\EFI\\\\$id\\\\grubx64.efi" | head -n1 | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p')"
+		if [ -n "$new" ]; then
+			if [ "$make_default" = yes ]; then
+				efibootmgr -o "$new${before:+,$before}" >>"$BR_LOG" 2>&1
+			else
+				efibootmgr -o "${before:+$before,}$new" >>"$BR_LOG" 2>&1
+			fi
+		fi
+	elif [ "$make_default" = yes ]; then
+		local cur rest
+		cur="$(efibootmgr -v | grep -i "\\\\EFI\\\\$id\\\\grubx64.efi" | head -n1 | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p')"
+		rest="$(efibootmgr | sed -n 's/^BootOrder: //p' | tr ',' '\n' | grep -vi "^$cur\$" | paste -sd,)"
+		efibootmgr -o "$cur${rest:+,$rest}" >>"$BR_LOG" 2>&1
+	fi
+	efibootmgr >"$root/boot/grub/repair-$BR_TIME/efibootmgr-after.txt" 2>&1
+	sync
+	umount "$esp"
+	br_mount "$espdev" "$esp" ro
+	br_ro "$i"
+	ui_msg "Bass GRUB reinstalled to EFI/$id/ on $espdev."
+}
+
+br_reinstall_bios() {
+	local i="$1" root disk owner label
+	root="${BR_MP[$i]}"
+	disk="$(br_disk_of "${BR_DEV[$i]}")"
+	label="$(br_disk_label "$disk")"
+	if [ "$label" = gpt ] && ! br_has_bios_grub "$disk"; then
+		ui_msg "$disk uses GPT but has no BIOS boot partition (bios_grub, 1 MiB).\n\nGRUB cannot be installed for legacy BIOS on this disk without one. Nothing was changed."
+		return 1
+	fi
+	owner="$(br_mbr_owner "$disk")"
+	case "$owner" in
+	empty | grub) ;;
+	*)
+		if ! ui_yesno "The boot code on $disk belongs to: $owner.\n\nReplacing it can stop that system from starting. Choose No to keep it and add Bass OS to the other boot manager instead (the entry is shown next).\n\nReplace the boot code with Bass GRUB?" no; then
+			ui_msg "Add this entry to the other GRUB (for example /etc/grub.d/40_custom, then run update-grub):\n\n$(br_chain_snippet "${BR_UUID[$i]}")"
+			return 1
+		fi
+		;;
+	esac
+	if [ "$owner" = grub ] && ! ui_yesno "$disk already starts a GRUB. It may belong to another Linux system.\n\nReplace it with Bass GRUB?" no; then
+		ui_msg "Add this entry to the other GRUB:\n\n$(br_chain_snippet "${BR_UUID[$i]}")"
+		return 1
+	fi
+	br_rw "$i" || return 1
+	mkdir -p "$root/boot/grub/repair-$BR_TIME"
+	dd if="$disk" of="$root/boot/grub/repair-$BR_TIME/disk-first-1MiB.bin" bs=1M count=1 2>>"$BR_LOG"
+	if grub-install --target=i386-pc --boot-directory="$root/boot" "$disk" >>"$BR_LOG" 2>&1; then
+		br_ro "$i"
+		ui_msg "Bass GRUB installed to the boot code of $disk.\nThe old first MiB is saved in boot/grub/repair-$BR_TIME/."
+	else
+		br_ro "$i"
+		ui_msg "grub-install failed; see $BR_LOG."
+		return 1
+	fi
+}
+
+br_fsck() {
+	local i="$1"
+	case "${BR_FS[$i]}" in ext2 | ext3 | ext4) ;; *)
+		ui_msg "Filesystem check is only offered for ext4 partitions."
+		return 1
+		;;
+	esac
+	ui_yesno "Check the filesystem of ${BR_DEV[$i]} (e2fsck -p)?" || return 1
+	sync
+	umount "${BR_MP[$i]}" || return 1
+	e2fsck -p "${BR_DEV[$i]}" >>"$BR_LOG" 2>&1
+	local rc=$?
+	br_mount "${BR_DEV[$i]}" "${BR_MP[$i]}" ro
+	ui_msg "e2fsck finished with code $rc (0 = clean, 1 = fixed). Details are in $BR_LOG."
+}
+
+br_install_menu() {
+	local i="$1" root choice opts
+	root="${BR_MP[$i]}"
+	while true; do
+		opts=(status "Check boot configuration")
+		br_cfg_valid "$root/boot/grub/android.cfg.good" && opts+=(good "Restore last working settings (android.cfg.good)")
+		br_cfg_valid "$root/boot/grub/android.cfg.bak" && opts+=(bak "Restore previous settings (android.cfg.bak)")
+		[ -s "$root/cmdline.txt" ] && opts+=(cmdline "Restore settings chosen at install time (cmdline.txt)")
+		[ -s "$BR_CDROM/cmdline.txt" ] && opts+=(defaults "Reset to default settings")
+		opts+=(grubcfg "Rebuild the GRUB menu (grub.cfg)")
+		opts+=(reinstall "Reinstall Bass GRUB (advanced)")
+		case "${BR_FS[$i]}" in ext*) opts+=(fsck "Check filesystem (e2fsck)") ;; esac
+		opts+=(back "Back")
+		choice="$(ui_menu "Bass OS on ${BR_DEV[$i]}${BR_LABEL[$i]:+ (${BR_LABEL[$i]})}\n\n$(br_status "$root")" "${opts[@]}")" || return
+		case "$choice" in
+		status) ui_msg "$(br_status "$root")" ;;
+		good | bak | cmdline | defaults) br_restore "$i" "$choice" ;;
+		grubcfg) br_regen_grubcfg "$i" ;;
+		reinstall)
+			if [ -d /sys/firmware/efi ]; then br_reinstall_uefi "$i"; else br_reinstall_bios "$i"; fi
+			;;
+		fsck) br_fsck "$i" ;;
+		back | "") return ;;
+		esac
+	done
+}
+
+br_main() {
+	local choice n args
+	if [ "$(id -u)" -ne 0 ]; then
+		echo "bass-repair must run as root" >&2
+		exit 1
+	fi
+	br_ui_init
+	: >"$BR_LOG"
+	trap br_cleanup EXIT
+	ui_msg "Bass OS repair\n\nThis tool fixes the boot files of an installed Bass OS. It does not touch your apps, data, or other operating systems, and asks before every change.\n\nDisks are opened read-only until you confirm a change."
+	br_scan
+	if [ "${#BR_DEV[@]}" -eq 0 ]; then
+		ui_msg "No Bass OS installation was found.\n\nPartitions are checked for boot/grub/android.cfg together with kernel, initrd and system image files."
+	fi
+	while true; do
+		args=()
+		for n in "${!BR_DEV[@]}"; do
+			args+=("$n" "${BR_DEV[$n]} ${BR_LABEL[$n]:-} ($(br_cfg_valid "${BR_MP[$n]}/boot/grub/android.cfg" && echo "config OK" || echo "config DAMAGED"))")
+		done
+		args+=(rescan "Search again" reboot "Reboot" quit "Quit")
+		choice="$(ui_menu "Choose the installation to repair:" "${args[@]}")" || choice=quit
+		case "$choice" in
+		rescan)
+			br_cleanup
+			br_scan
+			;;
+		reboot)
+			br_cleanup
+			reboot
+			;;
+		quit | "") break ;;
+		*) [ -n "${BR_DEV[$choice]:-}" ] && br_install_menu "$choice" ;;
+		esac
+	done
+}
+
+if [ "${BASS_REPAIR_LIB:-0}" != 1 ]; then
+	br_main "$@"
+fi

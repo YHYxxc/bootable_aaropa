@@ -92,7 +92,11 @@ scripts_sha256() {
       "${AAROPA_ROOT}/build/05-export.sh" \
       "${AAROPA_ROOT}/build/branding.sh" \
       "${AAROPA_ROOT}/build/options.sh" \
-      "${AAROPA_ROOT}/build/rootfs-theme.sh"
+      "${AAROPA_ROOT}/build/rootfs-theme.sh" \
+      "${AAROPA_ROOT}/build/repair.sh" \
+      "${AAROPA_ROOT}/overlay/iso/boot/grub/repair.cfg" \
+      "${AAROPA_ROOT}/overlay/rootfs/usr/bin/bass-repair" \
+      "${AAROPA_ROOT}/overlay/rootfs/usr/bin/bass-live-start"
     do
       [[ -f "$f" ]] && file_sha256 "$f"
     done

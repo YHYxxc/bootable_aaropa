@@ -63,6 +63,15 @@ You can also apply [this commit](https://github.com/BlissOS/device_generic_x86_6
 
 After that, just lunch and `make iso_img` like you usually do to build BlissOS.
 
+### Repair menu for installed systems
+
+`build/repair.sh` adds files from `overlay/` to both local and fetched builds:
+
+- `overlay/iso/boot/grub/repair.cfg` and a hook in `iso/boot/grub/grub.cfg`: the USB menu gets **Repair an existing installation**, which lists partitions holding an installed system (`boot/grub/android.cfg` plus `kernel`, `initrd` and `system` image of a slot). Each can be started with the release's default command line or with `boot/grub/android.cfg.good`, without reading a damaged `android.cfg`.
+- `overlay/rootfs/usr/bin/bass-repair` (and `bass-live-start`) in `install.sfs`: **Open the repair tool** boots the live session with `BASS_REPAIR=1`, which starts a `dialog` tool instead of the installer. It restores `android.cfg`, rebuilds `grub.cfg`, or reinstalls GRUB to the install's own ESP or disk, asking first and backing files up to `boot/grub/repair-<time>/`. It never writes `data/`, `data.img` or other systems' files without consent.
+
+Fetched releases need `podman` and `squashfs-tools` to add the tool to `install.sfs`; without them only the GRUB entries are added.
+
 ## Meaning behind the name
 
 Ānanda & Āropa combines the Sanskrit words "Ananda" (bliss) and "Aropa" (imposing or placing upon), creating a phrase that means "blissful installation" or "blissful startup."

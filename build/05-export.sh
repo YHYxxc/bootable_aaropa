@@ -3,7 +3,7 @@
 # Sourced by aaropa-prebuilt.sh.
 
 aaropa_export_image() {
-  local runtime tag work cid helper
+  local runtime tag work cid helper repair_tool=0
   runtime="${AAROPA_RUNTIME:-$(aaropa_detect_runtime)}" || aaropa_die "need podman or docker"
   tag="${AAROPA_IMAGE_TAG:-$(aaropa_image_tag)}"
   work="${AAROPA_CACHE_DIR}/rootfs"
@@ -22,6 +22,7 @@ aaropa_export_image() {
   aaropa_apply_branding "${work}/install"
   aaropa_apply_install_options "${work}/install"
   aaropa_apply_rootfs_theme "${work}/install"
+  aaropa_apply_repair_rootfs "${work}/install" && repair_tool=1
 
   if [[ "$runtime" != "podman" ]]; then
     aaropa_die "local export currently requires podman unshare (no sudo). Install podman or use --fetch"
@@ -66,6 +67,7 @@ aaropa_export_image() {
   mv -f "${work}/out/boot_hybrid.img" "${AAROPA_ROOT}/boot_hybrid.img"
   command -v 7z >/dev/null 2>&1 || aaropa_die "7z is required to extract grub-rescue.iso"
   7z x "${work}/out/grub-rescue.iso" -o"${AAROPA_ROOT}/iso" -y >/dev/null
+  aaropa_apply_repair_iso "${AAROPA_ROOT}/iso" "$repair_tool"
   tar -xzf "${work}/out/initrd_lib.tar.gz" -C "$AAROPA_ROOT"
   chmod -R 755 "${AAROPA_ROOT}/initrd_lib"
 

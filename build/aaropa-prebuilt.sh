@@ -34,6 +34,8 @@ source "${AAROPA_BUILD_DIR}/branding.sh"
 source "${AAROPA_BUILD_DIR}/options.sh"
 # shellcheck source=rootfs-theme.sh
 source "${AAROPA_BUILD_DIR}/rootfs-theme.sh"
+# shellcheck source=repair.sh
+source "${AAROPA_BUILD_DIR}/repair.sh"
 
 AAROPA_MODE="${AAROPA_MODE:-local}"
 AAROPA_SOURCE="${AAROPA_SOURCE:-}"

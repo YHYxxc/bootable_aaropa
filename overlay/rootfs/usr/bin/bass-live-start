@@ -1,0 +1,13 @@
+#!/bin/sh
+# Live session start (JWM StartupCommand). The USB GRUB entry "Repair an existing
+# installation > Open the repair tool" adds BASS_REPAIR=1; start bass-repair then,
+# otherwise the installer as before.
+
+if grep -qw 'BASS_REPAIR=1' /proc/cmdline; then
+	if command -v qterminal >/dev/null 2>&1; then
+		exec qterminal -e /usr/bin/bass-repair
+	fi
+	exec xterm -e /usr/bin/bass-repair
+fi
+
+exec bash -c /usr/bin/aaropa-calamares

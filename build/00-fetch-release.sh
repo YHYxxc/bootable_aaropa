@@ -40,7 +40,7 @@ aaropa_extract_grub_rescue() {
 }
 
 aaropa_fetch_release() {
-  local repo tag assets asset url dest initrd_only
+  local repo tag assets asset url dest initrd_only repair_tool=0
   repo="$AAROPA_RELEASE_REPO"
   tag="$AAROPA_RELEASE_TAG"
   initrd_only="${AAROPA_INITRD_ONLY:-0}"
@@ -75,6 +75,12 @@ aaropa_fetch_release() {
     if [[ -f "${AAROPA_ROOT}/install.sfs" ]]; then
       mkdir -p "${AAROPA_ROOT}/iso"
       mv -f "${AAROPA_ROOT}/install.sfs" "${AAROPA_ROOT}/iso/install.sfs"
+    fi
+    if [[ -f "${AAROPA_ROOT}/iso/install.sfs" ]]; then
+      aaropa_apply_repair_sfs "${AAROPA_ROOT}/iso/install.sfs" && repair_tool=1
+    fi
+    if [[ -f "${AAROPA_ROOT}/iso/boot/grub/grub.cfg" ]]; then
+      aaropa_apply_repair_iso "${AAROPA_ROOT}/iso" "$repair_tool"
     fi
   fi
 
