@@ -7,6 +7,8 @@
 # What it may write, always after a copy to <install>/boot/grub/repair-<time>/:
 #   <install>/boot/grub/android.cfg and grub.cfg       (default, config only)
 #   \EFI\<id>\ on the install's ESP, one NVRAM entry     (only "Reinstall Bass GRUB")
+#   grubx64.efi in other \EFI\ dirs of the same install  (same; their old GRUB cannot
+#                                                         load the new /boot/grub modules)
 #   \EFI\Boot\bootx64.efi                                (only when absent or ours,
 #                                                         or after explicit consent)
 #   the MBR of the install's disk                        (BIOS, only after consent)
@@ -166,25 +168,54 @@ br_write_android_cfg() {
 
 # ------------------------------------------------------------- ESP / UEFI rules
 
-# ESP UUID recorded by the installer in <root>/fstab.android (genfstab -U).
+# ESP UUID recorded by the installer in <root>/fstab.android (genfstab -U names the
+# /boot/efi mount "esp").
 br_fstab_esp_uuid() {
 	[ -f "$1/fstab.android" ] || return 0
-	awk '$2 == "/boot/efi" && $1 ~ /^UUID=/ { sub(/^UUID=/, "", $1); print $1; exit }' "$1/fstab.android"
+	awk '($2 == "esp" || $2 == "/boot/efi") && $1 ~ /^UUID=/ { sub(/^UUID=/, "", $1); print $1; exit }' "$1/fstab.android"
 }
 
-# EFI directories on a mounted ESP whose GRUB image embeds UUID (GRUB embeds the
-# install's filesystem UUID in its search command).
+# br_prefix_needles PART_NUM: strings in a GRUB core installed with the ESP on the same
+# disk as the install: grub-install then hardcodes the partition ("(,gpt2)/boot/grub")
+# instead of searching for the filesystem UUID.
+br_prefix_needles() {
+	[ -n "$1" ] || return 0
+	printf '(,gpt%s)/boot/grub\n(,msdos%s)/boot/grub\n' "$1" "$1"
+}
+
+# br_is_install_loader FILE UUID NEEDLES...: FILE is a GRUB core built for this install.
+br_is_install_loader() {
+	local f="$1" uuid="$2" n
+	shift 2
+	[ -n "$uuid" ] && grep -aqi -- "$uuid" "$f" && return 0
+	for n in "$@"; do
+		grep -aqF -- "$n" "$f" && return 0
+	done
+	return 1
+}
+
+# br_esp_dirs_for_uuid ESP UUID [NEEDLES...]: EFI directories on a mounted ESP with a
+# GRUB core for this install ("search.fs_uuid UUID", or the partition NEEDLES).
 br_esp_dirs_for_uuid() {
 	local esp="$1" uuid="$2" f d
-	[ -n "$uuid" ] || return 0
+	shift 2
 	for f in "$esp"/[Ee][Ff][Ii]/*/grub*.efi; do
 		[ -f "$f" ] || continue
 		case "$f" in */[Ee][Ff][Ii]/[Bb][Oo][Oo][Tt]/*) continue ;; esac
-		if grep -aqi "$uuid" "$f"; then
+		if br_is_install_loader "$f" "$uuid" "$@"; then
 			d="${f%/*}"
 			echo "${d##*/}"
 		fi
 	done | sort -u
+}
+
+# EFI directory names of the firmware boot entries, in boot order.
+br_boot_order_dirs() {
+	local out n
+	out="$(efibootmgr -v 2>/dev/null)" || return 0
+	for n in $(sed -n 's/^BootOrder: //p' <<<"$out" | tr ',' ' '); do
+		grep -i "^Boot$n" <<<"$out" | sed -nE 's/.*\\EFI\\([^\\]+)\\.*/\1/Ip' | head -n1
+	done
 }
 
 # Short listing of an ESP's EFI directories, e.g. "Boot Microsoft ubuntu".
@@ -198,13 +229,13 @@ br_esp_contents() {
 	echo "${out:-empty}"
 }
 
-# br_choose_esp FSTAB_UUID INSTALL_UUID INSTALL_DISK < "dev uuid disk mountpoint" lines
+# br_choose_esp FSTAB_UUID INSTALL_UUID INSTALL_DISK [PART_NUM] < "dev uuid disk mountpoint" lines
 # Prints the chosen ESP device, or ASK when the user has to pick.
 #   1. ESP whose UUID is in fstab.android
-#   2. ESP with an EFI directory that embeds the install UUID
+#   2. ESP with an EFI directory that has a GRUB core for the install
 #   3. the only ESP on the install's disk
 br_choose_esp() {
-	local want="$1" uuid="$2" disk="$3" dev euuid edisk emp same_disk=() n=0
+	local want="$1" uuid="$2" disk="$3" part="${4:-}" dev euuid edisk emp same_disk=() n=0 needles=()
 	local -a devs=() uuids=() disks=() mps=()
 	while read -r dev euuid edisk emp; do
 		[ -n "$dev" ] || continue
@@ -222,7 +253,9 @@ br_choose_esp() {
 		done
 	fi
 	for n in "${!devs[@]}"; do
-		if [ -n "${mps[$n]}" ] && [ -n "$(br_esp_dirs_for_uuid "${mps[$n]}" "$uuid")" ]; then
+		needles=()
+		[ "${disks[$n]}" = "$disk" ] && mapfile -t needles < <(br_prefix_needles "$part")
+		if [ -n "${mps[$n]}" ] && [ -n "$(br_esp_dirs_for_uuid "${mps[$n]}" "$uuid" "${needles[@]}")" ]; then
 			echo "${devs[$n]}"
 			return
 		fi
@@ -237,20 +270,32 @@ br_choose_esp() {
 	echo ASK
 }
 
-# EFI directory id to use: the one that already boots this install, else BassOS-<uuid8>.
+# br_efi_id ESP UUID [NEEDLES...]: EFI directory id to use: the one that already boots
+# this install (the firmware's first entry when there are several), else BassOS-<uuid8>.
 br_efi_id() {
-	local esp="$1" uuid="$2" id
-	id="$(br_esp_dirs_for_uuid "$esp" "$uuid" | head -n1)"
-	if [ -z "$id" ]; then
+	local esp="$1" uuid="$2" dirs id="" o d
+	dirs="$(br_esp_dirs_for_uuid "$@")"
+	if [ -n "$dirs" ]; then
+		while read -r o; do
+			while read -r d; do
+				if [ -n "$o" ] && [ "${d,,}" = "${o,,}" ]; then
+					id="$d"
+					break 2
+				fi
+			done <<<"$dirs"
+		done < <(br_boot_order_dirs)
+		[ -n "$id" ] || id="$(head -n1 <<<"$dirs")"
+	else
 		id="BassOS-$(printf '%s' "$uuid" | tr -d '-' | cut -c1-8)"
 	fi
 	echo "$id"
 }
 
-# State of \EFI\Boot\bootx64.efi relative to this install:
+# br_fallback_state ESP ID UUID [NEEDLES...]: state of \EFI\Boot\bootx64.efi relative to this install:
 #   absent | ours | foreign-microsoft | foreign-shim | foreign-grub | foreign
 br_fallback_state() {
 	local esp="$1" id="$2" uuid="$3" fb ours
+	shift 3
 	fb="$(br_fallback_path "$esp")"
 	[ -n "$fb" ] || {
 		echo absent
@@ -259,7 +304,7 @@ br_fallback_state() {
 	ours="$esp/EFI/$id/grubx64.efi"
 	if [ -f "$ours" ] && cmp -s "$fb" "$ours"; then
 		echo ours
-	elif [ -n "$uuid" ] && grep -aqi "$uuid" "$fb"; then
+	elif br_is_install_loader "$fb" "$uuid" "$@"; then
 		echo ours
 	elif grep -aq "Microsoft" "$fb" && grep -aq -i "bootmgr" "$fb"; then
 		echo foreign-microsoft
@@ -640,16 +685,18 @@ br_regen_grubcfg() {
 
 br_reinstall_uefi() {
 	local i="$1" root uuid disk want esp espdev esps line id state nv fb_action make_default=no part_num summary
+	local root_part others="" d needles=()
 	root="${BR_MP[$i]}"
 	uuid="${BR_UUID[$i]}"
 	disk="$(br_disk_of "${BR_DEV[$i]}")"
+	root_part="$(lsblk -no PARTN "${BR_DEV[$i]}" 2>/dev/null | head -n1 | tr -d ' ')"
 	want="$(br_fstab_esp_uuid "$root")"
 	esps="$(br_esps)"
 	[ -n "$esps" ] || {
 		ui_msg "No EFI system partition found. Nothing was changed."
 		return 1
 	}
-	espdev="$(br_choose_esp "$want" "$uuid" "$disk" <<<"$esps")"
+	espdev="$(br_choose_esp "$want" "$uuid" "$disk" "$root_part" <<<"$esps")"
 	if [ "$espdev" = ASK ]; then
 		local args=()
 		while read -r line; do
@@ -660,22 +707,33 @@ br_reinstall_uefi() {
 	fi
 	esp="$(awk -v d="$espdev" '$1 == d { print $4 }' <<<"$esps")"
 	[ -n "$esp" ] || return 1
+	[ "$(br_disk_of "$espdev")" = "$disk" ] && mapfile -t needles < <(br_prefix_needles "$root_part")
 
-	id="$(br_efi_id "$esp" "$uuid")"
-	state="$(br_fallback_state "$esp" "$id" "$uuid")"
+	id="$(br_efi_id "$esp" "$uuid" "${needles[@]}")"
+	state="$(br_fallback_state "$esp" "$id" "$uuid" "${needles[@]}")"
+	# Other EFI directories with an older GRUB of this install: that core cannot load the
+	# modules grub-install puts in /boot/grub ("symbol ... not found").
+	while read -r d; do
+		[ -n "$d" ] && [ "$d" != "$id" ] && others="${others:+$others }$d"
+	done < <(br_esp_dirs_for_uuid "$esp" "$uuid" "${needles[@]}")
 	# UI text goes through printf %b, so ESP paths are shown with / (a \b would be a backspace).
 	case "$state" in
 	absent | ours) fb_action="write EFI/Boot/bootx64.efi (currently $state)" ;;
 	*) fb_action="leave EFI/Boot/bootx64.efi alone ($state)" ;;
 	esac
-	if efibootmgr -v 2>/dev/null | grep -qi "\\\\EFI\\\\$id\\\\grubx64.efi"; then
+	if efibootmgr -v 2>/dev/null | grep -qi "\\\\EFI\\\\$id\\\\"; then
 		nv="keep the existing boot entry for EFI/$id"
 	else
 		nv="add one boot entry \"Bass OS\" for EFI/$id"
 	fi
 	ui_yesno "Make Bass OS the first boot entry?\n\nChoose No to keep the current boot order (Windows or another system stays the default)." no && make_default=yes
 
-	summary="Install: ${BR_DEV[$i]} (UUID $uuid)\nESP: $espdev, contains: $(br_esp_contents "$esp")\nGRUB goes to: EFI/$id/\nNVRAM: $nv\nBoot order: $([ "$make_default" = yes ] && echo "Bass OS first" || echo unchanged)\nFallback: $fb_action\n\nNo other EFI directory is changed."
+	summary="Install: ${BR_DEV[$i]} (UUID $uuid)\nESP: $espdev, contains: $(br_esp_contents "$esp")\nGRUB goes to: EFI/$id/\nNVRAM: $nv\nBoot order: $([ "$make_default" = yes ] && echo "Bass OS first" || echo unchanged)\nFallback: $fb_action"
+	if [ -n "$others" ]; then
+		summary+="\nAlso updated (older GRUB of this install): $others\n\nNo other EFI directory is changed."
+	else
+		summary+="\n\nNo other EFI directory is changed."
+	fi
 	if br_bitlocker_on_disk "$disk"; then
 		summary+="\n\nWARNING: this disk has a BitLocker volume. Changing boot entries can make Windows ask for the BitLocker recovery key. Have it ready."
 	fi
@@ -699,6 +757,10 @@ br_reinstall_uefi() {
 		ui_msg "grub-install failed; see $BR_LOG."
 		return 1
 	fi
+	for d in $others; do
+		cp -a "$esp/EFI/$d/grubx64.efi" "$root/boot/grub/repair-$BR_TIME/$d-grubx64.efi" 2>/dev/null
+		cp -f "$esp/EFI/$id/grubx64.efi" "$esp/EFI/$d/grubx64.efi" && br_log "updated EFI/$d/grubx64.efi"
+	done
 
 	case "$state" in
 	absent | ours) br_install_fallback "$esp" "$id" ;;
@@ -709,12 +771,12 @@ br_reinstall_uefi() {
 		;;
 	esac
 
-	if ! efibootmgr -v 2>/dev/null | grep -qi "\\\\EFI\\\\$id\\\\grubx64.efi"; then
+	if ! efibootmgr -v 2>/dev/null | grep -qi "\\\\EFI\\\\$id\\\\"; then
 		part_num="$(lsblk -no PARTN "$espdev" 2>/dev/null | head -n1)"
 		local before new
 		before="$(efibootmgr | sed -n 's/^BootOrder: //p')"
 		efibootmgr -C -d "$(br_disk_of "$espdev")" -p "$part_num" -L "Bass OS" -l "\\EFI\\$id\\grubx64.efi" >>"$BR_LOG" 2>&1
-		new="$(efibootmgr -v | grep -i "\\\\EFI\\\\$id\\\\grubx64.efi" | head -n1 | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p')"
+		new="$(efibootmgr -v | grep -i "\\\\EFI\\\\$id\\\\" | head -n1 | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p')"
 		if [ -n "$new" ]; then
 			if [ "$make_default" = yes ]; then
 				efibootmgr -o "$new${before:+,$before}" >>"$BR_LOG" 2>&1
@@ -724,7 +786,7 @@ br_reinstall_uefi() {
 		fi
 	elif [ "$make_default" = yes ]; then
 		local cur rest
-		cur="$(efibootmgr -v | grep -i "\\\\EFI\\\\$id\\\\grubx64.efi" | head -n1 | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p')"
+		cur="$(efibootmgr -v | grep -i "\\\\EFI\\\\$id\\\\" | head -n1 | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p')"
 		rest="$(efibootmgr | sed -n 's/^BootOrder: //p' | tr ',' '\n' | grep -vi "^$cur\$" | paste -sd,)"
 		efibootmgr -o "$cur${rest:+,$rest}" >>"$BR_LOG" 2>&1
 	fi
