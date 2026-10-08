@@ -34,6 +34,7 @@ aaropa_prepare_build_context() {
   if [[ -f "$pkglist" ]] && ! grep -qx 'dialog' "$pkglist"; then
     printf '\n%s\n' dialog >>"$pkglist"
   fi
+  aaropa_calamares_add_to_context "$ctx"
   AAROPA_BUILD_CTX="$ctx"
 }
 

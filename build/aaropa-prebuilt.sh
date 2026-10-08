@@ -36,6 +36,8 @@ source "${AAROPA_BUILD_DIR}/options.sh"
 source "${AAROPA_BUILD_DIR}/rootfs-theme.sh"
 # shellcheck source=repair.sh
 source "${AAROPA_BUILD_DIR}/repair.sh"
+# shellcheck source=calamares.sh
+source "${AAROPA_BUILD_DIR}/calamares.sh"
 
 AAROPA_MODE="${AAROPA_MODE:-local}"
 AAROPA_SOURCE="${AAROPA_SOURCE:-}"
@@ -163,6 +165,7 @@ if [[ "$AAROPA_MODE" == "local" ]]; then
     exit 0
   fi
 
+  aaropa_build_calamares_debs
   aaropa_build_image
   aaropa_export_image
   aaropa_write_stamp

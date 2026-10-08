@@ -96,7 +96,10 @@ scripts_sha256() {
       "${AAROPA_ROOT}/build/repair.sh" \
       "${AAROPA_ROOT}/overlay/iso/boot/grub/repair.cfg" \
       "${AAROPA_ROOT}/overlay/rootfs/usr/bin/bass-repair" \
-      "${AAROPA_ROOT}/overlay/rootfs/usr/bin/bass-live-start"
+      "${AAROPA_ROOT}/overlay/rootfs/usr/bin/bass-live-start" \
+      "${AAROPA_ROOT}/build/calamares.sh" \
+      "${AAROPA_ROOT}/build/calamares/Containerfile" \
+      "${AAROPA_CALAMARES_PATCHES:-${AAROPA_ROOT}/../../vendor/ax86-lite/patches/calamares}"/*/*.patch
     do
       [[ -f "$f" ]] && file_sha256 "$f"
     done

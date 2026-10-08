@@ -72,6 +72,15 @@ After that, just lunch and `make iso_img` like you usually do to build BlissOS.
 
 Fetched releases need `podman` and `squashfs-tools` to add the tool to `install.sfs`; without them only the GRUB entries are added.
 
+### Upgrading an existing installation (local Bass builds)
+
+`build/calamares.sh` rebuilds the installer's Calamares packages from the `[calamares.local]` pins in `aaropa.lock` plus the queues in `vendor/ax86-lite/patches/calamares/<repo>/` (`git am`; `AAROPA_CALAMARES_PATCHES` overrides the directory), in the `build/calamares/Containerfile` Podman image against the pinned upstream Calamares, and installs them in the image:
+
+- `aaropa_calamares_modules_bass`: an **Existing installation** page before partitioning. It finds installed systems (read-only mounts) and offers to upgrade one in place: partitioning and the data image page are skipped, apps and data are kept, and the boot options (`android.cfg` `CMDLINE`) can be kept. Installing an older Android than the one installed is refused. On BIOS it asks before replacing another system's boot code. The page skips itself when there is nothing to ask.
+- `aaropa_calamares`: an unformatted target keeps its `data.img` or `data/` unless the user chose to erase it; the bootloader keeps the firmware boot order on upgrade, never overwrites another system's `EFI/Boot/bootx64.efi`, and gives each Bass install its own EFI directory (`BassOS`, `BassOS1`, ...).
+
+`AAROPA_CALAMARES_LOCAL=0` builds the image with the stock packages. Drop the queues once they are merged in Ananda-Aropa and the pins move past them.
+
 ## Meaning behind the name
 
 Ānanda & Āropa combines the Sanskrit words "Ananda" (bliss) and "Aropa" (imposing or placing upon), creating a phrase that means "blissful installation" or "blissful startup."

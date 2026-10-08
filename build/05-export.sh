@@ -20,6 +20,7 @@ aaropa_export_image() {
 
   aaropa_restore_vfs_dirs "${work}/install"
   aaropa_apply_branding "${work}/install"
+  aaropa_apply_calamares_local "${work}/install"
   aaropa_apply_install_options "${work}/install"
   aaropa_apply_rootfs_theme "${work}/install"
   aaropa_apply_repair_rootfs "${work}/install" && repair_tool=1

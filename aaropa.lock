@@ -74,6 +74,18 @@ modules.ref=4f782792bb96bd13eedda4960fc6caf5733a0e22
 netinstall.url=https://github.com/Ananda-Aropa/aaropa_calamares_modules_netinstall.git
 netinstall.ref=960d7ad2102b8071bf371d22d5850d3791ae5b7d
 
+[calamares.local]
+# Bass local builds rebuild these at their pins plus vendor/ax86-lite
+# patches/calamares/<repo>/*.patch (build/calamares.sh) until the patches are merged
+# in Ananda-Aropa. Calamares is pinned instead of the repos' ci/update-version.sh
+# (latest upstream release).
+repos=aaropa_calamares aaropa_calamares_modules_bass
+calamares_version=3.3.14
+aaropa_calamares.url=https://github.com/Ananda-Aropa/aaropa_calamares.git
+aaropa_calamares.ref=103797b0dbd29a32afc26f086bda586cf74b77bd
+aaropa_calamares_modules_bass.url=https://github.com/Ananda-Aropa/aaropa_calamares_modules_bass.git
+aaropa_calamares_modules_bass.ref=4f782792bb96bd13eedda4960fc6caf5733a0e22
+
 [legacy.bliss-bass]
 # Stale Bliss-Bass forks. Not used for fetch or local image builds.
 # Rebase these onto Ananda-Aropa/Bliss when extra Bass install options return.
