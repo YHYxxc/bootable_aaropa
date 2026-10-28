@@ -1,4 +1,4 @@
-# Ānanda Āropa - The new initrd & installer combo for BlissOS
+# Ānanda Āropa - The new initrd & installer combo for LineageOS
 
 ## Introduction
 
@@ -50,7 +50,7 @@ This repo is used to generate the `rootfs` image for the installer. It get the a
 If your BlissOS source has `bootable/newinstaller`, remove it. After that, clone this repo to `bootable/aaropa`
 
 ```
-git clone https://github.com/BlissOS/bootable_aaropa.git
+git clone https://github.com/los-x86/bootable_aaropa.git
 ```
 
 Once done, run the `download.sh` script on the repo to get all the required files
